@@ -1,3 +1,13 @@
+
+PRIMEIRO = ESCOLHA A IMAGEM, OQUE VOCÊ VAI MUDAR
+SEGUNDO = TESTE A IMAGEM(GIF OU NORMAL)
+TERCEIRO = CONVERTA .CUR PARA .ANI(SE FOR GIF)
+QUARTO = APLICAR
+
+AO CONVERTER VOCÊ SO TERÁ ELA CONVERTIDA NA PASTA, TERA DE MUDAR NAS OPÇÕES DE MOUSE DO SEU PC PARA APLICA-LÁ
+
+
+
 # ============================================================
 # 🧩 Customizador Global de Cursores - Versão 9
 # ============================================================
