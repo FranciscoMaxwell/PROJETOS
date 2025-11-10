@@ -1,0 +1,425 @@
+#Versão 9
+
+import os
+import uuid
+import ctypes
+import tempfile
+import threading
+import time
+import struct
+import subprocess
+from io import BytesIO
+from tkinter import Tk, filedialog, messagebox, Button, Label, Scale, HORIZONTAL, Toplevel
+from PIL import Image, ImageSequence, ImageFilter, ImageChops
+
+# ============================
+# CONFIGURAÇÃO BASE (sua pasta 'Textos/cursores')
+# ============================
+BASE_DIR = r"C:\Users\Maxwell Fernandes\Downloads\Textos\cursores"
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# ============================
+# UTILITÁRIOS DE IMAGEM (ANTI-BORDA)
+# ============================
+
+def remover_pixels_quase_transparentes(img, threshold=20):
+    """Zera pixels com alpha abaixo do threshold para evitar ruído de borda."""
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    datas = list(img.getdata())
+    out = []
+    for px in datas:
+        if px[3] < threshold:
+            out.append((0, 0, 0, 0))
+        else:
+            out.append(px)
+    img.putdata(out)
+    return img
+
+def suavizar_borda(img, radius=1):
+    """Aplica blur muito suave só na alpha para suavizar a transição."""
+    # separar canais
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    r, g, b, a = img.split()
+    a = a.filter(ImageFilter.GaussianBlur(radius=radius))
+    return Image.merge("RGBA", (r, g, b, a))
+
+def cortar_e_centralizar(img, tamanho_alvo):
+    """
+    Recorta bbox do conteúdo visível e centraliza dentro de um canvas tamanho_alvo.
+    Retorna nova imagem RGBA de tamanho_alvo x tamanho_alvo.
+    """
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    bbox = img.getbbox()
+    if not bbox:
+        # nada visível, retorna canvas vazio
+        return Image.new("RGBA", (tamanho_alvo, tamanho_alvo), (0, 0, 0, 0))
+    crop = img.crop(bbox)
+    # redimensiona proporcionalmente para caber no tamanho_alvo
+    crop.thumbnail((tamanho_alvo, tamanho_alvo), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (tamanho_alvo, tamanho_alvo), (0, 0, 0, 0))
+    x = (tamanho_alvo - crop.width) // 2
+    y = (tamanho_alvo - crop.height) // 2
+    canvas.paste(crop, (x, y), crop)
+    return canvas
+
+# ============================
+# Funções principais de conversão
+# ============================
+
+def imagem_para_cur(imagem_or_path, fator_escala=3.0, sensibilidade=25, temp_dir=None):
+    """
+    Aceita path (string) ou PIL.Image.
+    Gera um .cur real (a partir de ICO em memória) com hotspot 0,0.
+    Retorna caminho do .cur.
+    """
+    TAM_PADRAO = 32
+    tamanho_alvo = int(TAM_PADRAO * fator_escala)
+    tamanho_final = (tamanho_alvo, tamanho_alvo)
+
+    if isinstance(imagem_or_path, Image.Image):
+        img = imagem_or_path.convert("RGBA")
+        base_name = "frame"
+    else:
+        img = Image.open(imagem_or_path).convert("RGBA")
+        base_name = os.path.splitext(os.path.basename(imagem_or_path))[0]
+
+    # limpar fundo e aplicar anti-borda
+    img = limpar_fundo(img, sensibilidade)
+    img = remover_pixels_quase_transparentes(img, threshold=20)
+    img = suavizar_borda(img, radius=1)
+    img = cortar_e_centralizar(img, tamanho_alvo)
+
+    if temp_dir is None:
+        temp_dir = tempfile.gettempdir()
+    os.makedirs(temp_dir, exist_ok=True)
+
+    unique_id = uuid.uuid4().hex[:8]
+    cur_path = os.path.join(temp_dir, f"{base_name}_{unique_id}.cur")
+
+    # salvar ICO em buffer e converter para CUR (mudar tipo e hotspot)
+    buffer = BytesIO()
+    img.save(buffer, format="ICO", sizes=[tamanho_final])
+    ico_bytes = buffer.getvalue()
+    cur_bytes = bytearray(ico_bytes)
+    if len(cur_bytes) >= 14:
+        cur_bytes[2] = 2  # tipo = cursor
+        cur_bytes[10:12] = struct.pack('<H', 0)
+        cur_bytes[12:14] = struct.pack('<H', 0)
+
+    with open(cur_path, 'wb') as f:
+        f.write(cur_bytes)
+
+    return cur_path
+
+def limpar_fundo(img, sensibilidade=25):
+    """
+    Versão preservadora: tenta limpar fundo apenas quando imagem não tem transparência parcial.
+    Mantida do seu código original com pequenas garantias de segurança.
+    """
+    from PIL import ImageFilter
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    try:
+        aext = img.getchannel('A').getextrema()
+        if aext[0] < 255:
+            return img
+    except Exception:
+        pass
+
+    largura, altura = img.size
+    pixels = img.load()
+
+    amostras = [
+        pixels[0, 0],
+        pixels[largura - 1, 0],
+        pixels[0, altura - 1],
+        pixels[largura - 1, altura - 1],
+    ]
+    media_fundo = tuple(sum(c[i] for c in amostras) // 4 for i in range(3))
+
+    bordas = img.filter(ImageFilter.FIND_EDGES).convert("L")
+    mask_pixels = bordas.load()
+    limite = max(15, min(120, sensibilidade * 1.2))
+
+    for y in range(altura):
+        for x in range(largura):
+            r, g, b, a = pixels[x, y]
+            if a < 10:
+                continue
+            dist = ((r - media_fundo[0]) ** 2 + (g - media_fundo[1]) ** 2 + (b - media_fundo[2]) ** 2) ** 0.5
+            brilho = (r + g + b) / 3
+            borda_intensa = mask_pixels[x, y] > 40
+            if dist < limite and not borda_intensa and brilho > 160:
+                pixels[x, y] = (r, g, b, 0)
+    return img
+
+def criar_subpasta_por_gif(gif_path):
+    base = os.path.splitext(os.path.basename(gif_path))[0]
+    unique = uuid.uuid4().hex[:6]
+    pasta = os.path.join(BASE_DIR, f"{base}_{unique}")
+    os.makedirs(pasta, exist_ok=True)
+    return pasta
+
+def gif_para_curs(gif_path, fator_escala=3.0, sensibilidade=25, temp_dir=None, max_frames=None):
+    """
+    Converte GIF em vários .cur aplicando anti-borda em cada frame.
+    Salva em subpasta única dentro de BASE_DIR e retorna (frames_list, pasta)
+    """
+    img = Image.open(gif_path)
+    if temp_dir is None:
+        temp_dir = criar_subpasta_por_gif(gif_path)
+
+    TAM_PADRAO = 32
+    tamanho_alvo = int(TAM_PADRAO * fator_escala)
+
+    frames_paths = []
+    for i, frame in enumerate(ImageSequence.Iterator(img)):
+        if max_frames is not None and i >= max_frames:
+            break
+        frame = frame.convert("RGBA")
+        frame = limpar_fundo(frame, sensibilidade)
+        # anti-borda: remover quase-transparentes, suavizar alpha, cortar e centralizar
+        frame = remover_pixels_quase_transparentes(frame, threshold=20)
+        frame = suavizar_borda(frame, radius=1)
+        frame = cortar_e_centralizar(frame, tamanho_alvo)
+
+        # gerar .cur a partir do PIL.Image já processado
+        cur_path = imagem_para_cur(frame, fator_escala=fator_escala, sensibilidade=sensibilidade, temp_dir=temp_dir)
+        # renomear para sequência ordenada
+        novo = os.path.join(temp_dir, f"frame_{i:03d}.cur")
+        try:
+            os.replace(cur_path, novo)
+        except Exception:
+            # se replace falhar, copia manualmente
+            with open(cur_path, 'rb') as src, open(novo, 'wb') as dst:
+                dst.write(src.read())
+        frames_paths.append(novo)
+
+    return frames_paths, temp_dir
+
+# ============================
+# Montagem do .ANI (RIFF ACON)
+# ============================
+
+def _make_chunk_bytes(chunk_id: bytes, data: bytes) -> bytes:
+    size = len(data)
+    pad = b'\x00' if (size % 2) == 1 else b''
+    return chunk_id + struct.pack('<I', size) + data + pad
+
+def frames_para_ani(frames_list, output_ani_path, fps=10, title=None, author=None):
+    """
+    Monta .ani compatível a partir dos bytes dos .cur/.ico.
+    """
+    icons_data = []
+    for fpath in frames_list:
+        with open(fpath, 'rb') as f:
+            icons_data.append(f.read())
+
+    cFrames = len(icons_data)
+    cbSizeof = 36
+    jifRate = max(1, round(60 / max(1, fps)))
+    fl = 0x1  # AF_ICON
+
+    anih = struct.pack('<9I', cbSizeof, cFrames, cFrames, 0, 0, 0, 0, jifRate, fl)
+    rate_data = b''.join(struct.pack('<I', jifRate) for _ in range(cFrames))
+    icon_chunks = b''.join(_make_chunk_bytes(b'icon', d) for d in icons_data)
+    fram_list_data = b'fram' + icon_chunks
+    fram_chunk = _make_chunk_bytes(b'LIST', fram_list_data)
+    subchunks = _make_chunk_bytes(b'anih', anih) + _make_chunk_bytes(b'rate', rate_data) + fram_chunk
+    total_size = 4 + len(subchunks)
+
+    with open(output_ani_path, 'wb') as f:
+        f.write(b'RIFF')
+        f.write(struct.pack('<I', total_size))
+        f.write(b'ACON')
+        f.write(subchunks)
+    return output_ani_path
+
+# ============================
+# Funções de aplicar/restaurar cursor no Windows
+# ============================
+def aplicar_cursor_global(cursor_dict):
+    import winreg
+    reg_path = r"Control Panel\Cursors"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_SET_VALUE) as key:
+            # usa nomes de registro apropriados
+            if cursor_dict.get("padrao"):
+                winreg.SetValueEx(key, "", 0, winreg.REG_SZ, cursor_dict["padrao"])
+            if cursor_dict.get("texto"):
+                winreg.SetValueEx(key, "IBeam", 0, winreg.REG_SZ, cursor_dict["texto"])
+            if cursor_dict.get("botao"):
+                winreg.SetValueEx(key, "Hand", 0, winreg.REG_SZ, cursor_dict["botao"])
+            if cursor_dict.get("carregando"):
+                winreg.SetValueEx(key, "AppStarting", 0, winreg.REG_SZ, cursor_dict["carregando"])
+        # força refresh
+        ctypes.windll.user32.SystemParametersInfoW(0x0057, 0, None, 0)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha ao aplicar cursores: {e}")
+
+def restaurar_cursor_padrao():
+    try:
+        ctypes.windll.user32.SystemParametersInfoW(0x0057, 0, None, 0)
+        messagebox.showinfo("Restauração", "Cursores padrão restaurados com sucesso!")
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha ao restaurar cursores padrão: {e}")
+
+# ============================
+# Fluxo e GUI (mantidos)
+# ============================
+cursor_paths = {"padrao": None, "texto": None, "botao": None, "carregando": None}
+frames_ativos = []
+thread_animacao = None
+animando = False
+ultima_pasta = None
+
+def escolher_imagem(tipo):
+    global ultima_pasta, frames_ativos
+    caminho = filedialog.askopenfilename(
+        title=f"Escolher imagem do cursor ({tipo})",
+        filetypes=[("Imagens", "*.png *.jpg *.jpeg *.ico *.cur *.bmp *.gif")]
+    )
+    if not caminho:
+        return
+    sensibilidade = escala_sensibilidade.get()
+    if caminho.lower().endswith(".gif"):
+        max_frames = escala_frames.get()
+        frames, pasta = gif_para_curs(caminho, fator_escala=3.0, sensibilidade=sensibilidade, max_frames=max_frames)
+        cursor_paths[tipo] = frames[0] if frames else None
+        ultima_pasta = pasta
+        frames_ativos = frames
+        botao_teste_animacao.config(state="normal")
+        botao_cur_para_ani.config(state="normal")
+        messagebox.showinfo("GIF convertido", f"GIF convertido em {len(frames)} frames.\nSalvos em:\n{pasta}")
+    else:
+        cursor_temp = imagem_para_cur(caminho, fator_escala=3.0, sensibilidade=sensibilidade, temp_dir=BASE_DIR)
+        cursor_paths[tipo] = cursor_temp
+        messagebox.showinfo("OK", f"Imagem '{tipo}' carregada e convertida!\nSalvo em:\n{cursor_temp}")
+
+def animar_cursor(frames, fps):
+    global animando
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    intervalo = 1 / max(1, fps)
+    while animando:
+        for frame in frames:
+            if not animando:
+                break
+            hcursor = user32.LoadImageW(0, frame, 2, 0, 0, 0x00000010)
+            if hcursor:
+                user32.SetSystemCursor(hcursor, 32512)
+            time.sleep(intervalo)
+
+def iniciar_animacao():
+    global animando, thread_animacao
+    if not frames_ativos:
+        messagebox.showwarning("Aviso", "Nenhum GIF convertido ainda.")
+        return
+    if animando:
+        animando = False
+        botao_teste_animacao.config(text="▶️ Testar Animação (em tempo real)")
+        return
+    animando = True
+    botao_teste_animacao.config(text="⏹️ Parar Animação")
+    fps = escala_frames.get()
+    thread_animacao = threading.Thread(target=animar_cursor, args=(frames_ativos, fps), daemon=True)
+    thread_animacao.start()
+
+def aplicar_todos():
+    if not any(cursor_paths.values()):
+        messagebox.showwarning("Atenção", "Escolha pelo menos um cursor antes de aplicar.")
+        return
+    try:
+        aplicar_cursor_global(cursor_paths)
+        messagebox.showinfo("Sucesso", "Cursores aplicados globalmente!")
+    except Exception as e:
+        messagebox.showerror("Erro", str(e))
+
+def criar_nome_resultado_automatico(pasta):
+    base = "resultado"
+    ext = ".ani"
+    i = 0
+    while True:
+        if i == 0:
+            nome = f"{base}{ext}"
+        else:
+            nome = f"{base}({i}){ext}"
+        destino = os.path.join(pasta, nome)
+        if not os.path.exists(destino):
+            return destino
+        i += 1
+
+def cur_para_ani_salvar():
+    global frames_ativos, ultima_pasta
+    if frames_ativos:
+        pasta = ultima_pasta
+    else:
+        pasta = filedialog.askdirectory(title="Selecione a pasta com arquivos .cur")
+        if not pasta:
+            return
+        frames_ativos = [os.path.join(pasta, f) for f in sorted(os.listdir(pasta)) if f.lower().endswith(".cur")]
+        if not frames_ativos:
+            messagebox.showwarning("Aviso", "Nenhum arquivo .cur encontrado nessa pasta.")
+            return
+        ultima_pasta = pasta
+
+    destino_ani = criar_nome_resultado_automatico(pasta)
+    fps = escala_frames.get()
+    try:
+        out = frames_para_ani(frames_ativos, destino_ani, fps=fps)
+        try:
+            subprocess.Popen(f'explorer /select,"{out}"')
+        except Exception:
+            pass
+        win = Toplevel(root)
+        win.title("Sucesso")
+        Label(win, text=f".ANI salvo com sucesso!\n\n{out}", font=("Segoe UI", 9)).pack(padx=15, pady=10)
+        Button(win, text="🔍 Abrir pasta", width=20, command=lambda: subprocess.Popen(f'explorer /select,"{out}"')).pack(pady=5)
+        Button(win, text="Fechar", width=20, command=win.destroy).pack(pady=5)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Falha ao criar .ANI: {e}")
+
+def fechar():
+    global animando
+    animando = False
+    restaurar_cursor_padrao()
+    root.destroy()
+
+# ============================
+# GUI
+# ============================
+root = Tk()
+root.title("Customizador Global de Cursores")
+root.geometry("420x680")
+root.resizable(False, False)
+
+Label(root, text="Escolha imagens para cada tipo de cursor", font=("Segoe UI", 10, "bold")).pack(pady=10)
+Button(root, text="🖱️ Cursor Padrão (GIF ou imagem)", width=35, command=lambda: escolher_imagem("padrao")).pack(pady=5)
+Button(root, text="✍️ Cursor sobre Texto", width=35, command=lambda: escolher_imagem("texto")).pack(pady=5)
+Button(root, text="🔲 Cursor sobre Botão", width=35, command=lambda: escolher_imagem("botao")).pack(pady=5)
+Button(root, text="⌛ Cursor de Carregamento", width=35, command=lambda: escolher_imagem("carregando")).pack(pady=5)
+
+Label(root, text="Força da remoção de fundo:", font=("Segoe UI", 9, "italic")).pack(pady=(10, 0))
+escala_sensibilidade= Scale(root, from_=0, to=100, orient=HORIZONTAL, length=300)
+escala_sensibilidade.set(25)
+escala_sensibilidade.pack()
+
+Label(root, text="Máx. de frames do GIF (FPS)", font=("Segoe UI", 9, "italic")).pack(pady=(15, 0))
+escala_frames = Scale(root, from_=1, to=30, orient=HORIZONTAL, length=300)
+escala_frames.set(10)
+escala_frames.pack()
+
+botao_teste_animacao = Button(root, text="▶️ Testar Animação (em tempo real)", width=35, state="disabled", command=iniciar_animacao)
+botao_teste_animacao.pack(pady=10)
+
+botao_cur_para_ani = Button(root, text="🔁 Converter CURs (frames) → .ANI", width=35, state="disabled", command=cur_para_ani_salvar)
+botao_cur_para_ani.pack(pady=6)
+
+Button(root, text="✅ Aplicar Todos os Cursores", width=35, command=aplicar_todos).pack(pady=10)
+Button(root, text="🔄 Restaurar Cursores Padrão", width=35, command=restaurar_cursor_padrao).pack(pady=5)
+Button(root, text="❌ Fechar", width=35, command=fechar).pack(pady=10)
+
+root.protocol("WM_DELETE_WINDOW", fechar)
+root.mainloop()
