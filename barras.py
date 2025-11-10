@@ -1,0 +1,342 @@
+# """
+# visualizador_vortex_v2.py
+# Versão melhorada do seu visualizador Vortex:
+# - Vortex maior (preenche mais a tela) e mais fluido
+# - Pulso (rings) sincronizado com a música
+# - Slider de volume funcional (clicável/arrastável + teclas)
+# - Barra de progresso clicável/arrastável (seek tentativa via pygame; fallback notifica)
+# - Partículas com rastro leve
+# - Pequenas otimizações de desempenho
+# OBS: Ainda usa librosa para análise; para seek robusto em MP3/OGG alguns builds do pygame podem não suportar `play(start=...)`.
+# """
+
+# import os, math, time, random
+# import pygame
+# import numpy as np
+# import librosa
+
+# # -----------------------
+# # CONFIG
+# # -----------------------
+# AUDIO_DIR = r"C:\Users\Maxwell Fernandes\.vscode\audios"
+# EXTS = (".mp3", ".wav", ".ogg")
+# SR = 22050
+# HOP_LENGTH = 1024
+# N_FFT = 2048
+# FPS = 60
+# WIDTH, HEIGHT = 1280, 720
+
+# VORTEX_COLOR = (100, 200, 255)
+# ACCENT = (180, 100, 255)
+# BG = (8, 8, 12)
+
+# # -----------------------
+# # UTIL
+# # -----------------------
+# def list_tracks(folder):
+#     if not os.path.isdir(folder):
+#         return []
+#     return [os.path.join(folder, f) for f in sorted(os.listdir(folder)) if f.lower().endswith(EXTS)]
+
+# def compute_mag(path):
+#     y, sr = librosa.load(path, sr=SR, mono=True)
+#     S = np.abs(librosa.stft(y, n_fft=N_FFT, hop_length=HOP_LENGTH))
+#     S_log = np.log1p(S)
+#     mag = S_log.mean(axis=0)
+#     mag /= (mag.max() + 1e-8)
+#     times = librosa.frames_to_time(np.arange(len(mag)), sr=sr, hop_length=HOP_LENGTH)
+#     return y, sr, librosa.get_duration(y=y, sr=sr), mag, times
+
+# def format_time(t):
+#     t = max(0, t)
+#     return f"{int(t//60):02d}:{int(t%60):02d}"
+
+# # -----------------------
+# # PARTICLE com rastro simples
+# # -----------------------
+# class Particle:
+#     def __init__(self, x, y, color):
+#         self.x, self.y = x, y
+#         self.vx, self.vy = random.uniform(-0.8,0.8), random.uniform(-1.6,-0.4)
+#         self.life = random.uniform(0.9, 2.0)
+#         self.age = 0.0
+#         self.size = random.uniform(2.5,5.5)
+#         self.color = color
+#         self.trail = []
+
+#     def update(self, dt, amp):
+#         self.vx *= (0.995 - 0.01*dt)
+#         self.vy -= 0.02 * amp
+#         self.x += self.vx * (1 + amp*2.5)
+#         self.y += self.vy * (1 + amp*2.5)
+#         self.age += dt
+#         self.size *= (0.995 - 0.002*dt)
+#         # trail
+#         self.trail.append((self.x, self.y))
+#         if len(self.trail) > 8:
+#             self.trail.pop(0)
+
+#     def draw(self, surf):
+#         # draw trail
+#         if len(self.trail) > 1:
+#             for i in range(len(self.trail)-1):
+#                 a = int(200 * (i / (len(self.trail)-1)))
+#                 col = (max(0,min(255,int(self.color[0]* (i/len(self.trail))))),
+#                        max(0,min(255,int(self.color[1]* (i/len(self.trail))))),
+#                        max(0,min(255,int(self.color[2]* (i/len(self.trail))))), a)
+#                 pygame.draw.line(surf, col, self.trail[i], self.trail[i+1], 2)
+#         # main dot
+#         alpha = max(0, int(255 * (1 - self.age / self.life)))
+#         col = (*self.color, alpha)
+#         pygame.draw.circle(surf, col, (int(self.x), int(self.y)), max(1,int(self.size)))
+
+#     def dead(self):
+#         return self.age >= self.life or self.size <= 0.3
+
+# # -----------------------
+# # MAIN
+# # -----------------------
+# def main():
+#     tracks = list_tracks(AUDIO_DIR)
+#     if not tracks:
+#         print("Nenhuma faixa encontrada em:", AUDIO_DIR)
+#         return
+
+#     print("Pré-carregando metadados (análise rápida)...")
+#     songs = []
+#     for f in tracks:
+#         print(" ->", os.path.basename(f))
+#         y, sr, dur, mag, times = compute_mag(f)
+#         songs.append({"path": f, "title": os.path.basename(f), "y": y, "sr": sr, "dur": dur, "mag": mag, "times": times})
+
+#     pygame.init()
+#     pygame.mixer.init(frequency=SR)
+#     screen = pygame.display.set_mode((WIDTH, HEIGHT))
+#     pygame.display.set_caption("Vortex Visualizer v2 (melhorado)")
+#     clock = pygame.time.Clock()
+#     font = pygame.font.SysFont(None, 22)
+#     big = pygame.font.SysFont(None, 36)
+
+#     idx = 0
+#     song = songs[idx]
+#     try:
+#         pygame.mixer.music.load(song["path"])
+#         pygame.mixer.music.play()
+#     except Exception as e:
+#         print("Erro ao iniciar reprodução:", e)
+#         return
+
+#     start_time = time.time()
+#     volume = 0.75
+#     pygame.mixer.music.set_volume(volume)
+
+#     particles = []
+#     paused = False
+#     dragging_progress = False
+#     dragging_volume = False
+
+#     def try_seek(t_seconds):
+#         nonlocal start_time
+#         """Tenta fazer seek usando pygame.mixer.music.play(start=...) - se falhar, notifica."""
+#         try:
+#             pygame.mixer.music.stop()
+#             pygame.mixer.music.play(start=t_seconds)
+#             start_time = time.time() - t_seconds
+#             return True
+#         except Exception:
+#             print("Seek não suportado para esse formato/build do pygame. Use WAV/OGG para seek confiável.")
+#             return False
+
+#     print("Iniciando player. Espaço = play/pause, ← → = prev/next, ↑ ↓ = volume.")
+#     running = True
+#     while running:
+#         dt = clock.tick(FPS) / 1000.0
+#         for ev in pygame.event.get():
+#             if ev.type == pygame.QUIT:
+#                 running = False
+#                 pygame.mixer.music.stop()
+#             elif ev.type == pygame.MOUSEBUTTONDOWN:
+#                 mx,my = ev.pos
+#                 # progress bar region
+#                 prog_y = HEIGHT - 120
+#                 prog_h = 18
+#                 prog_x = 30
+#                 prog_w = WIDTH - 60
+#                 if prog_x <= mx <= prog_x + prog_w and prog_y <= my <= prog_y + prog_h:
+#                     frac = (mx - prog_x) / prog_w
+#                     t = frac * song["dur"]
+#                     if try_seek(t):
+#                         start_time = time.time() - t
+#                 # volume slider
+#                 vol_rect = pygame.Rect(WIDTH-220, HEIGHT-95, 160, 12)
+#                 if vol_rect.collidepoint(mx,my):
+#                     dragging_volume = True
+#                     frac = (mx - vol_rect.x) / vol_rect.w
+#                     volume = max(0.0, min(1.0, frac))
+#                     pygame.mixer.music.set_volume(volume)
+#                 else:
+#                     dragging_volume = False
+
+#             elif ev.type == pygame.MOUSEBUTTONUP:
+#                 dragging_volume = False
+
+#             elif ev.type == pygame.MOUSEMOTION and dragging_volume:
+#                 mx,my = ev.pos
+#                 vol_rect = pygame.Rect(WIDTH-220, HEIGHT-95, 160, 12)
+#                 frac = (mx - vol_rect.x) / vol_rect.w
+#                 volume = max(0.0, min(1.0, frac))
+#                 pygame.mixer.music.set_volume(volume)
+
+#             elif ev.type == pygame.KEYDOWN:
+#                 if ev.key == pygame.K_SPACE:
+#                     if paused:
+#                         pygame.mixer.music.unpause(); paused = False
+#                         # adjust start_time?
+#                         start_time = time.time() - cur_time
+#                     else:
+#                         pygame.mixer.music.pause(); paused = True
+#                 elif ev.key == pygame.K_RIGHT:
+#                     idx = (idx + 1) % len(songs)
+#                     song = songs[idx]
+#                     pygame.mixer.music.load(song["path"]); pygame.mixer.music.play(); start_time = time.time()
+#                 elif ev.key == pygame.K_LEFT:
+#                     idx = (idx - 1) % len(songs)
+#                     song = songs[idx]
+#                     pygame.mixer.music.load(song["path"]); pygame.mixer.music.play(); start_time = time.time()
+#                 elif ev.key == pygame.K_UP:
+#                     volume = min(1.0, volume + 0.05); pygame.mixer.music.set_volume(volume)
+#                 elif ev.key == pygame.K_DOWN:
+#                     volume = max(0.0, volume - 0.05); pygame.mixer.music.set_volume(volume)
+
+#         # playback time (best effort)
+#         pos_ms = pygame.mixer.music.get_pos()
+#         if pos_ms >= 0:
+#             cur_time = pos_ms / 1000.0
+#         else:
+#             cur_time = time.time() - start_time
+
+#         # auto-next when finished
+#         if not pygame.mixer.music.get_busy() and not paused:
+#             # small pause and next
+#             time.sleep(0.05)
+#             idx = (idx + 1) % len(songs)
+#             song = songs[idx]
+#             try:
+#                 pygame.mixer.music.load(song["path"])
+#                 pygame.mixer.music.play()
+#                 start_time = time.time()
+#             except Exception as e:
+#                 print("Erro ao avançar para próxima faixa:", e)
+
+#         # spectral amplitude
+#         t_idx = np.searchsorted(song["times"], cur_time)
+#         t_idx = np.clip(t_idx, 0, len(song["mag"])-1)
+#         amp = float(song["mag"][t_idx])
+
+#         # DRAW
+#         screen.fill(BG)
+#         cx, cy = WIDTH//2, HEIGHT//2 - 40
+
+#         # big vortex parameters (bigger & smoother)
+#         n_layers = 6
+#         max_radius = min(WIDTH, HEIGHT) * 0.48  # maior, preenche mais
+#         time_now = time.time()
+
+#         for i in range(n_layers):
+#             segs = 200
+#             # radius increases per layer and pulses with amp
+#             base = max_radius * (0.18 + i * 0.12)
+#             pulse = 1.0 + amp * (0.25 + i*0.07)
+#             ring_radius = base * pulse
+#             surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+#             # smoother color gradient per layer
+#             col_r = max(0, min(255, VORTEX_COLOR[0] + i * 8))
+#             col_g = max(0, min(255, VORTEX_COLOR[1] - i * 6))
+#             col_b = max(0, min(255, VORTEX_COLOR[2] - i * 10))
+#             alpha_layer = int(60 + 120 * (0.25 + amp*0.75) * (1 - i / n_layers))
+#             pts = []
+#             for j in range(segs):
+#                 theta = (j / segs) * 2 * math.pi
+#                 wobble = 1.0 + 0.12 * math.sin(theta * 3 + time_now * (0.8 + i*0.2))
+#                 r = ring_radius * wobble
+#                 # add spiral offset for vortex feel
+#                 spiral = 0.6 * (j / segs) * (1 + 0.4 * math.sin(time_now + i))
+#                 x = cx + math.cos(theta + spiral) * r
+#                 y = cy + math.sin(theta + spiral) * r
+#                 pts.append((int(x), int(y)))
+#                 # small dot to make ring visible
+#                 dot_alpha = max(10, alpha_layer - int(80 * (i / n_layers)))
+#                 dot_col = (col_r, col_g, col_b, dot_alpha)
+#                 pygame.draw.circle(surf, dot_col, (int(x), int(y)), 2)
+#             # slight blur-like overlay by drawing aalines
+#             pygame.draw.aalines(surf, (col_r, col_g, col_b, int(alpha_layer*0.5)), True, pts)
+#             screen.blit(surf, (0,0))
+
+#         # center glow (pulse)
+#         glow = pygame.Surface((500,500), pygame.SRCALPHA)
+#         for r in range(10,0,-1):
+#             a = int(80 * (1 - r/10) * (0.8 + amp))
+#             rad = int(30 + r*18 + amp*80)
+#             pygame.draw.circle(glow, (100, 220, 255, a), (250,250), rad)
+#         screen.blit(glow, (cx-250, cy-250), special_flags=pygame.BLEND_PREMULTIPLIED)
+
+#         # particles spawn (orbiting outward)
+#         if random.random() < amp * 1.2:
+#             angle = random.uniform(0, 2*math.pi)
+#             r0 = max_radius * 0.9
+#             px = cx + math.cos(angle)*r0
+#             py = cy + math.sin(angle)*r0
+#             col = (100 + random.randint(0,155), 200 + random.randint(-20,40), 200 + random.randint(-50,50))
+#             particles.append(Particle(px, py, col))
+#         # update/draw particles
+#         for p in particles[:]:
+#             p.update(dt, amp)
+#             p.draw(screen)
+#             if p.dead():
+#                 particles.remove(p)
+
+#         # radial spokes reacting to spectrum
+#         spokes = 48
+#         for s in range(spokes):
+#             theta = (s/spokes) * 2*math.pi + time_now*0.3
+#             sample_idx = int((s/spokes) * len(song["mag"]))
+#             strength = song["mag"][sample_idx] if len(song["mag"])>0 else 0.0
+#             r0 = max_radius * 0.06
+#             r1 = r0 + 120 * (0.6 + strength*1.2) * (0.8 + amp)
+#             x0 = cx + math.cos(theta)*r0
+#             y0 = cy + math.sin(theta)*r0
+#             x1 = cx + math.cos(theta)*r1
+#             y1 = cy + math.sin(theta)*r1
+#             col = (int(140 + 100*strength), int(160 - 40*strength), 255)
+#             pygame.draw.aaline(screen, col, (x0,y0), (x1,y1))
+
+#         # UI title
+#         title = big.render(song["title"], True, (230,230,240))
+#         screen.blit(title, (30, 18))
+
+#         # progress bar
+#         prog_x, prog_y, prog_w, prog_h = 40, HEIGHT - 120, WIDTH - 80, 18
+#         pygame.draw.rect(screen, (30,30,45), (prog_x, prog_y, prog_w, prog_h), border_radius=8)
+#         frac = cur_time / song["dur"] if song["dur"]>0 else 0
+#         frac = max(0.0, min(1.0, frac))
+#         pygame.draw.rect(screen, (30,220,160), (prog_x, prog_y, int(prog_w*frac), prog_h), border_radius=8)
+#         knob_x = prog_x + int(prog_w*frac)
+#         pygame.draw.circle(screen, (255,255,255), (knob_x, prog_y + prog_h//2), 9)
+
+#         # volume slider
+#         vol_rect = pygame.Rect(WIDTH-220, HEIGHT-95, 160, 12)
+#         pygame.draw.rect(screen, (55,55,65), vol_rect, border_radius=6)
+#         pygame.draw.rect(screen, (0,200,120), (vol_rect.x, vol_rect.y, int(vol_rect.w * volume), vol_rect.h), border_radius=6)
+#         vol_text = font.render(f"Vol: {int(volume*100)}%", True, (220,220,220))
+#         screen.blit(vol_text, (vol_rect.x + vol_rect.w + 8, vol_rect.y - 2))
+
+#         # time label
+#         time_label = font.render(f"{format_time(cur_time)} / {format_time(song['dur'])}", True, (200,200,200))
+#         screen.blit(time_label, (30, HEIGHT-85))
+
+#         pygame.display.flip()
+
+#     pygame.quit()
+
+# if __name__ == "__main__":
+#     main()

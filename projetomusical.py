@@ -1,0 +1,116 @@
+import os
+import yt_dlp
+import librosa
+import numpy as np
+import pandas as pd
+from googleapiclient.discovery import build
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
+from PIL import Image
+import requests
+from io import BytesIO
+
+# =========================
+# CONFIGURAÇÕES
+# =========================
+YOUTUBE_API_KEY = "AIzaSyAjBmMnrtjw1Yt2Ijdjvi2m_ecGcuhrpYc"
+SEARCH_TERMS = ["top music 2025", "rock hits", "pop music"]
+MAX_RESULTS = 5
+AUDIO_DIR = "audios"
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+# =========================
+# FUNÇÕES
+# =========================
+def search_youtube_videos(query, max_results=5):
+    youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+    req = youtube.search().list(q=query, part="snippet", type="video", maxResults=max_results)
+    res = req.execute()
+    videos = []
+    for item in res["items"]:
+        title = item["snippet"]["title"]
+        video_id = item["id"]["videoId"]
+        thumbnail = item["snippet"]["thumbnails"]["high"]["url"]  # alta resolução
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        videos.append({"title": title, "url": url, "thumbnail": thumbnail})
+    return videos
+
+def show_thumbnail(thumbnail_url):
+    response = requests.get(thumbnail_url)
+    img = Image.open(BytesIO(response.content))
+    img.show()
+
+def download_audio(url, output_dir="audios"):
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+        "quiet": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        audio_file = os.path.splitext(filename)[0] + ".wav"
+        return audio_file if os.path.exists(audio_file) else None
+
+def extract_features(audio_path, n_mfcc=13):
+    y, sr = librosa.load(audio_path, duration=30)
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    return np.mean(mfccs.T, axis=0)
+
+# =========================
+# COLETA DE VÍDEOS
+# =========================
+all_videos = []
+for term in SEARCH_TERMS:
+    videos = search_youtube_videos(term, MAX_RESULTS)
+    all_videos.extend(videos)
+
+print(f"Total de vídeos encontrados: {len(all_videos)}")
+
+# =========================
+# DOWNLOAD INTERATIVO COM THUMBNAIL
+# =========================
+features_list = []
+for video in all_videos:
+    print(f"\nTítulo: {video['title']}")
+    show_thumbnail(video["thumbnail"])
+    resposta = input("Deseja baixar este áudio? (s/n): ").lower()
+    if resposta != "s":
+        continue
+
+    audio_file = download_audio(video["url"], AUDIO_DIR)
+    if audio_file:
+        features = extract_features(audio_file)
+        features_list.append({"title": video["title"], "url": video["url"], "features": features})
+
+# =========================
+# TREINAMENTO FICTÍCIO KNN
+# =========================
+X_train = np.random.rand(20, 13)
+y_train = np.random.choice(["Pop", "Rock", "Jazz", "Metal"], 20)
+X_test = np.array([f["features"] for f in features_list])
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+knn = KNeighborsClassifier(n_neighbors=3)
+knn.fit(X_train_scaled, y_train)
+
+y_pred = knn.predict(X_test_scaled)
+
+# =========================
+# RESULTADOS
+# =========================
+for i, video in enumerate(features_list):
+    video["predicted_genre"] = y_pred[i]
+
+df_results = pd.DataFrame([
+    {"title": v["title"], "url": v["url"], "predicted_genre": v["predicted_genre"]}
+    for v in features_list
+])
+df_results.to_csv("youtube_genres.csv", index=False)
+print("Classificação concluída. Resultados salvos em youtube_genres.csv")
+
+
